@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Invoice — Foreman</title>
+<meta name="description" content="Your invoice.">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#fcfcfa" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#15171a" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/assets/foreman.css">
+</head>
+<body>
+
+<div id="root" class="doc-wrap">
+  <div id="loading" class="state-pad">
+    <div class="spinner" aria-hidden="true"></div>
+    <div class="state-body">Loading your invoice…</div>
+  </div>
+</div>
+
+<script src="/assets/foreman.js"></script>
+<script>
+(function () {
+  'use strict';
+  var F = window.Foreman;
+  var token = F.getToken();
+  var root = document.getElementById('root');
+  var CCY = 'USD';
+
+  function stateScreen(title, body, link) {
+    root.innerHTML =
+      '<div class="state-pad">' +
+        '<div class="state-title">' + F.escapeHtml(title) + '</div>' +
+        '<div class="state-body">' + F.escapeHtml(body) + '</div>' +
+        (link ? '<a class="btn-quiet" style="margin-top:14px" href="' + link.href + '">' + F.escapeHtml(link.label) + '</a>' : '') +
+      '</div>';
+  }
+
+  if (!token || token.length < 16) {
+    stateScreen('Invoice link looks off',
+      'This link is missing or incomplete. Please reopen the link from the message you were sent.',
+      { href: 'https://' + location.host + '/', label: 'About Foreman' });
+    return;
+  }
+
+  function logoBadge(biz) {
+    if (biz.logo_url) {
+      return '<div class="logo-badge"><img src="' + F.escapeHtml(biz.logo_url) +
+        '" alt="" onerror="this.parentNode.textContent=\'' + F.escapeHtml(F.initials(biz.name)) + '\'"></div>';
+    }
+    return '<div class="logo-badge">' + F.escapeHtml(F.initials(biz.name)) + '</div>';
+  }
+  function bizMeta(biz) {
+    var bits = [];
+    if (biz.license_no) bits.push('Lic #' + F.escapeHtml(biz.license_no));
+    if (biz.insurance_no) bits.push('Insured');
+    if (biz.phone) bits.push(F.escapeHtml(biz.phone));
+    return bits.join(' · ');
+  }
+  function linesHtml(lines) {
+    if (!lines || !lines.length) return '';
+    return lines.map(function (l, i) {
+      var last = i === lines.length - 1;
+      var qty = F.lineQty(l);
+      return '<div class="line"' + (last ? ' style="border-bottom:0"' : '') + '>' +
+        '<div style="min-width:0">' +
+          '<div class="line-desc">' + F.escapeHtml(l.description || '') + '</div>' +
+          (qty ? '<div class="line-qty">' + F.escapeHtml(qty) + '</div>' : '') +
+        '</div>' +
+        '<div class="line-amt money-m">' + F.money(l.total, CCY) + '</div>' +
+      '</div>';
+    }).join('');
+  }
+
+  // Derive status: explicit doc.status, else infer from amounts + due date.
+  function deriveState(doc) {
+    var total = Number(doc.total || 0);
+    var paid = Number(doc.amount_paid || 0);
+    var balance = Math.max(0, total - paid);
+    var status = doc.status;
+    var overdue = false;
+    if (status !== 'paid' && balance > 0 && doc.due_date) {
+      var due = new Date(doc.due_date);
+      if (!isNaN(due.getTime()) && due.getTime() < Date.now()) overdue = true;
+    }
+    var kind;
+    if (status === 'paid' || balance <= 0) kind = 'paid';
+    else if (paid > 0) kind = 'partial';
+    else if (overdue || status === 'overdue') kind = 'overdue';
+    else kind = 'due';
+    return { kind: kind, total: total, paid: paid, balance: balance };
+  }
+
+  function stampFor(kind) {
+    var label = { paid: 'Paid', partial: 'Partial', overdue: 'Overdue', due: 'Due' }[kind];
+    return '<span class="stamp stamp--' + kind + ' stamp--animate">' + label + '</span>';
+  }
+
+  function render(payload) {
+    var doc = payload.document;
+    var biz = payload.business || {};
+    var lines = payload.lines || [];
+    CCY = biz.currency || 'USD';
+    var st = deriveState(doc);
+
+    var billedTo = payload.client_first_name ? F.escapeHtml(payload.client_first_name) : 'You';
+
+    // Big balance / paid block.
+    var balanceBlock;
+    if (st.kind === 'paid') {
+      var paidWhen = doc.due_date ? '' : '';
+      balanceBlock =
+        '<div class="balance-block">' +
+          '<div class="balance-label">Balance due</div>' +
+          '<div class="money-xl" style="color:var(--cash)">' + F.money(0, CCY) + '</div>' +
+          '<div class="balance-note" style="color:var(--cash)">Paid in full — thank you!</div>' +
+        '</div>';
+    } else {
+      var paidNote = st.paid > 0
+        ? '<div class="balance-note" style="color:var(--cash)">' + F.money(st.paid, CCY) + ' paid — thanks</div>'
+        : '';
+      var dueNote = '';
+      if (st.kind === 'overdue' && doc.due_date) {
+        dueNote = '<div class="balance-note" style="color:var(--alarm)">Was due ' + F.escapeHtml(F.formatDate(doc.due_date)) + '</div>';
+      } else if (doc.due_date) {
+        dueNote = '<div class="balance-note">Due ' + F.escapeHtml(F.formatDate(doc.due_date)) + '</div>';
+      }
+      balanceBlock =
+        '<div class="balance-block">' +
+          '<div class="balance-label">Balance due</div>' +
+          '<div class="money-xl">' + F.money(st.balance, CCY) + '</div>' +
+          paidNote + dueNote +
+        '</div>';
+    }
+
+    // Totals: total, payments applied, bottom line.
+    var paymentRow = st.paid > 0
+      ? '<div class="total-row" style="margin-top:8px"><div class="total-label">Paid to date</div>' +
+        '<div class="money-s" style="color:var(--cash)">−' + F.money(st.paid, CCY) + '</div></div>'
+      : '';
+    var bottomLabel = st.kind === 'paid' ? 'Paid in full' : 'Balance due';
+    var bottomColor = st.kind === 'paid' ? 'var(--cash)' : (st.kind === 'overdue' ? 'var(--alarm)' : 'var(--ink)');
+    var bottomAmt = st.kind === 'paid' ? F.money(st.total, CCY) : F.money(st.balance, CCY);
+
+    var taxRow = (Number(doc.tax_amount) > 0 || Number(doc.tax_rate) > 0)
+      ? '<div class="total-row"><div class="total-label">Tax' +
+          (doc.tax_rate ? ' (' + doc.tax_rate + '%)' : '') + '</div>' +
+          '<div class="money-s">' + F.money(doc.tax_amount, CCY) + '</div></div>'
+      : '';
+
+    var issued = doc.due_date ? '' : '';
+    var dueLine = doc.due_date
+      ? '<div class="meta-sub">Due ' + F.escapeHtml(F.formatDate(doc.due_date)) + '</div>'
+      : '';
+
+    // Payment instructions (no online payment in scope — never a fake button).
+    var payHint;
+    if (st.kind === 'paid') {
+      payHint = 'This page is your receipt. Thank you for your business.';
+    } else {
+      var contact = biz.email ? biz.email : (biz.phone ? biz.phone : 'the business');
+      payHint = 'To pay ' + F.money(st.balance, CCY) + ', contact ' +
+        F.escapeHtml(biz.name || 'the business') +
+        (biz.email || biz.phone ? ' at ' + F.escapeHtml(contact) : '') +
+        ' to arrange payment. Or reply to the message this invoice came from.';
+    }
+    var terms = biz.terms ? ' ' + F.escapeHtml(biz.terms) : '';
+
+    var contactBtn = '';
+    if (st.kind !== 'paid' && (biz.email || biz.phone)) {
+      var href = biz.email
+        ? 'mailto:' + biz.email + '?subject=' + encodeURIComponent('Payment for invoice' + (doc.number != null ? ' #' + doc.number : ''))
+        : 'sms:' + String(biz.phone).replace(/[^\d+]/g, '');
+      contactBtn = '<div class="dock"><div class="dock-inner">' +
+        '<a class="btn-primary" style="display:flex;align-items:center;justify-content:center;text-decoration:none" href="' + href + '">Contact about payment</a>' +
+        '</div></div>';
+    }
+
+    var watermark = biz.watermark ? '<span class="watermark-note">Made with Foreman</span>' : '';
+
+    root.innerHTML =
+      '<div class="doc-col">' +
+        '<div class="doc-card">' +
+          '<div class="letterhead">' +
+            '<div class="letterhead-row">' +
+              logoBadge(biz) +
+              '<div style="min-width:0">' +
+                '<div class="biz-name">' + F.escapeHtml(biz.name || 'Your tradesperson') + '</div>' +
+                (bizMeta(biz) ? '<div class="biz-meta">' + bizMeta(biz) + '</div>' : '') +
+              '</div>' +
+            '</div>' +
+            '<div class="letterhead-stamp">' + stampFor(st.kind) + '</div>' +
+          '</div>' +
+          '<div class="doc-hr doc-hr--inset"></div>' +
+          '<div class="meta-row">' +
+            '<div>' +
+              '<div class="meta-label">Billed to</div>' +
+              '<div class="meta-strong">' + billedTo + '</div>' +
+            '</div>' +
+            '<div class="meta-right">' +
+              '<div class="meta-label">Invoice' + (doc.number != null ? ' #' + F.escapeHtml(String(doc.number)) : '') + '</div>' +
+              dueLine +
+            '</div>' +
+          '</div>' +
+          '<div class="doc-hr"></div>' +
+          balanceBlock +
+          '<div class="doc-hr"></div>' +
+          linesHtml(lines) +
+          '<div class="totals">' +
+            '<div class="total-row"><div class="total-label">Subtotal</div>' +
+              '<div class="money-s">' + F.money(doc.subtotal, CCY) + '</div></div>' +
+            taxRow +
+            '<div class="total-row" style="margin-top:8px"><div class="total-label">Total</div>' +
+              '<div class="money-s">' + F.money(st.total, CCY) + '</div></div>' +
+            paymentRow +
+            '<div class="totals-rule"></div>' +
+            '<div class="total-row"><div class="grand-label">' + bottomLabel + '</div>' +
+              '<div class="money-m" style="color:' + bottomColor + '">' + bottomAmt + '</div></div>' +
+          '</div>' +
+          '<div class="doc-hr doc-hr--inset"></div>' +
+          '<div class="footnote">' + payHint + terms + '</div>' +
+        '</div>' +
+        '<div class="sent-with"><a href="https://' + location.host + '/">Sent with Foreman</a>' + watermark + '</div>' +
+      '</div>' +
+      contactBtn;
+  }
+
+  F.fetchDocument('invoice', token).then(function (res) {
+    if (res.status === 404) {
+      stateScreen('Invoice not found',
+        'This invoice link is invalid or has been removed. Double-check the link, or reach out to the business that sent it.',
+        { href: 'https://' + location.host + '/', label: 'About Foreman' });
+      return;
+    }
+    if (!res.ok || !res.data || !res.data.document) {
+      stateScreen('Couldn’t load this invoice',
+        'Something went wrong on our end. Please try again in a moment.', null);
+      return;
+    }
+    render(res.data);
+  }).catch(function () {
+    stateScreen('Couldn’t load this invoice',
+      'Check your internet connection and try again.', null);
+  });
+})();
+</script>
+</body>
+</html>

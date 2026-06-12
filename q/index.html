@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Quote — Foreman</title>
+<meta name="description" content="Your quote.">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#fcfcfa" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#15171a" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/assets/foreman.css">
+</head>
+<body>
+
+<div id="root" class="doc-wrap">
+  <!-- Loading -->
+  <div id="loading" class="state-pad">
+    <div class="spinner" aria-hidden="true"></div>
+    <div class="state-body">Loading your quote…</div>
+  </div>
+</div>
+
+<!-- Accept dock (revealed when an open quote loads) -->
+<div id="dock" class="dock" hidden>
+  <div class="dock-inner">
+    <button id="acceptBtn" class="btn-primary" type="button">Accept &amp; sign</button>
+    <a id="askBtn" class="btn-quiet" href="https://apps.apple.com/app/id6779614706">Ask a question</a>
+  </div>
+</div>
+
+<!-- Signature sheet -->
+<div id="sheet" hidden>
+  <div class="scrim" id="scrim"></div>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+    <div class="sheet-card">
+      <div class="sheet-title" id="sheetTitle">Sign to accept</div>
+      <div class="sheet-sub" id="sheetSub">You're accepting this quote.</div>
+      <div class="sig-canvas-wrap">
+        <canvas id="sig" class="sig" width="856" height="320" aria-label="Signature pad"></canvas>
+        <div class="sig-hint" id="sigHint">Sign here with your finger</div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;margin-top:4px">
+        <button type="button" class="sig-clear" id="clearSig">Clear</button>
+      </div>
+      <label class="field-label" for="signedName">Your name</label>
+      <input id="signedName" class="field" type="text" autocomplete="name" placeholder="Type your full name">
+      <button type="button" id="confirmAccept" class="btn-primary" style="margin-top:14px;width:100%;flex:none">Sign &amp; accept</button>
+      <div id="acceptError" class="dock-note" style="color:var(--alarm);margin-top:10px" hidden></div>
+    </div>
+  </div>
+</div>
+
+<script src="/assets/foreman.js"></script>
+<script>
+(function () {
+  'use strict';
+  var F = window.Foreman;
+  var token = F.getToken();
+  var root = document.getElementById('root');
+  var dock = document.getElementById('dock');
+  var sheet = document.getElementById('sheet');
+
+  var DOC = null;        // last fetched payload
+  var CCY = 'USD';
+  var hasDrawn = false;
+  var ctx = null, canvas = null, drawing = false;
+
+  function stateScreen(title, body, link) {
+    dock.hidden = true;
+    root.innerHTML =
+      '<div class="state-pad">' +
+        '<div class="state-title">' + F.escapeHtml(title) + '</div>' +
+        '<div class="state-body">' + F.escapeHtml(body) + '</div>' +
+        (link ? '<a class="btn-quiet" style="margin-top:14px" href="' + link.href + '">' + F.escapeHtml(link.label) + '</a>' : '') +
+      '</div>';
+  }
+
+  if (!token || token.length < 16) {
+    stateScreen('Quote link looks off',
+      'This link is missing or incomplete. Please reopen the link from the text message you were sent.',
+      { href: 'https://' + location.host + '/', label: 'About Foreman' });
+    return;
+  }
+
+  // ---------- render ----------
+  function stampClass(status) {
+    var map = { sent: 'sent', viewed: 'viewed', accepted: 'accepted', declined: 'declined', draft: 'draft' };
+    return 'stamp--' + (map[status] || 'sent');
+  }
+  function stampLabel(status) {
+    if (status === 'accepted') return 'Accepted';
+    if (status === 'declined') return 'Declined';
+    return 'Sent';
+  }
+
+  function logoBadge(biz) {
+    if (biz.logo_url) {
+      return '<div class="logo-badge"><img src="' + F.escapeHtml(biz.logo_url) +
+        '" alt="" onerror="this.parentNode.textContent=\'' + F.escapeHtml(F.initials(biz.name)) + '\'"></div>';
+    }
+    return '<div class="logo-badge">' + F.escapeHtml(F.initials(biz.name)) + '</div>';
+  }
+
+  function bizMeta(biz) {
+    var bits = [];
+    if (biz.license_no) bits.push('Lic #' + F.escapeHtml(biz.license_no));
+    if (biz.insurance_no) bits.push('Insured');
+    if (biz.phone) bits.push(F.escapeHtml(biz.phone));
+    return bits.join(' · ');
+  }
+
+  function linesHtml(lines) {
+    if (!lines || !lines.length) return '';
+    return lines.map(function (l, i) {
+      var last = i === lines.length - 1;
+      var qty = F.lineQty(l);
+      return '<div class="line"' + (last ? ' style="border-bottom:0"' : '') + '>' +
+        '<div style="min-width:0">' +
+          '<div class="line-desc">' + F.escapeHtml(l.description || '') + '</div>' +
+          (qty ? '<div class="line-qty">' + F.escapeHtml(qty) + '</div>' : '') +
+        '</div>' +
+        '<div class="line-amt money-m">' + F.money(l.total, CCY) + '</div>' +
+      '</div>';
+    }).join('');
+  }
+
+  function exclusionsHtml(list) {
+    if (!list || !list.length) return '';
+    return '<div class="doc-hr doc-hr--inset"></div>' +
+      '<div class="excl">' +
+        '<div class="excl-label">Not included</div>' +
+        '<div class="excl-body">' + list.map(F.escapeHtml).join(' · ') + '</div>' +
+      '</div>';
+  }
+
+  function signatureBlock(doc) {
+    if (doc.status !== 'accepted') return '';
+    var name = doc.signed_name || 'the customer';
+    var when = doc.accepted_at ? F.formatDate(doc.accepted_at) : '';
+    return '<div class="doc-hr doc-hr--inset"></div>' +
+      '<div class="sig-block">' +
+        '<div class="excl-label">Accepted</div>' +
+        '<div style="margin-top:8px;height:60px;display:flex;align-items:flex-end">' + squiggleSvg() + '</div>' +
+        '<div class="sig-line"></div>' +
+        '<div class="sig-caption">Signed by ' + F.escapeHtml(name) + (when ? ' · ' + when : '') + '</div>' +
+      '</div>';
+  }
+
+  function squiggleSvg() {
+    return '<svg width="220" height="58" viewBox="0 0 240 64" aria-hidden="true" style="display:block">' +
+      '<path d="M12 48 C26 12 42 14 50 36 C56 52 64 54 74 38 C86 20 94 18 102 32 C110 46 120 48 132 34 C146 18 160 22 170 36 C178 47 196 48 212 36" ' +
+      'fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" style="color:var(--ink)"></path></svg>';
+  }
+
+  function depositLabel(doc) {
+    var pct = '';
+    if (doc.deposit_required && doc.total) {
+      var p = Math.round((Number(doc.deposit_required) / Number(doc.total)) * 100);
+      if (isFinite(p) && p > 0 && p < 100) pct = ' (' + p + '% deposit)';
+    }
+    return 'Due on acceptance' + pct;
+  }
+
+  function render(payload, animateStamp) {
+    var doc = payload.document;
+    var biz = payload.business || {};
+    var lines = payload.lines || [];
+    CCY = biz.currency || 'USD';
+
+    var stamp = '<span class="stamp ' + stampClass(doc.status) + (animateStamp ? ' stamp--animate' : '') + '">' +
+      F.escapeHtml(stampLabel(doc.status)) + '</span>';
+
+    var preparedFor = payload.client_first_name
+      ? F.escapeHtml(payload.client_first_name)
+      : 'You';
+
+    var taxRow = (Number(doc.tax_amount) > 0 || Number(doc.tax_rate) > 0)
+      ? '<div class="total-row"><div class="total-label">Tax' +
+          (doc.tax_rate ? ' (' + doc.tax_rate + '%)' : '') + '</div>' +
+          '<div class="money-s">' + F.money(doc.tax_amount, CCY) + '</div></div>'
+      : '';
+
+    var depositRow = Number(doc.deposit_required) > 0
+      ? '<div class="total-row" style="margin-top:10px"><div class="meta-sub" style="margin:0">' +
+          F.escapeHtml(depositLabel(doc)) + '</div>' +
+          '<div class="money-s">' + F.money(doc.deposit_required, CCY) + '</div></div>'
+      : '';
+
+    var validRow = doc.valid_until
+      ? '<div class="meta-sub">Valid until ' + F.escapeHtml(F.formatDate(doc.valid_until)) + '</div>'
+      : '';
+
+    var scope = doc.scope_summary
+      ? '<div class="doc-hr doc-hr--inset"></div>' +
+        '<div class="scope">' +
+          (doc.title ? '<div class="scope-title">' + F.escapeHtml(doc.title) + '</div>' : '') +
+          '<div class="scope-body">' + F.escapeHtml(doc.scope_summary) + '</div>' +
+        '</div>'
+      : (doc.title
+        ? '<div class="doc-hr doc-hr--inset"></div><div class="scope"><div class="scope-title">' + F.escapeHtml(doc.title) + '</div></div>'
+        : '');
+
+    var terms = biz.terms
+      ? '<div class="doc-hr doc-hr--inset"></div><div class="footnote">' + F.escapeHtml(biz.terms) + '</div>'
+      : '';
+
+    var watermark = biz.watermark
+      ? '<span class="watermark-note">Made with Foreman</span>'
+      : '';
+
+    root.innerHTML =
+      '<div class="doc-col">' +
+        '<div class="doc-card">' +
+          '<div class="letterhead">' +
+            '<div class="letterhead-row">' +
+              logoBadge(biz) +
+              '<div style="min-width:0">' +
+                '<div class="biz-name">' + F.escapeHtml(biz.name || 'Your tradesperson') + '</div>' +
+                (bizMeta(biz) ? '<div class="biz-meta">' + bizMeta(biz) + '</div>' : '') +
+              '</div>' +
+            '</div>' +
+            '<div class="letterhead-stamp">' + stamp + '</div>' +
+          '</div>' +
+          '<div class="doc-hr doc-hr--inset"></div>' +
+          '<div class="meta-row">' +
+            '<div>' +
+              '<div class="meta-label">Prepared for</div>' +
+              '<div class="meta-strong">' + preparedFor + '</div>' +
+            '</div>' +
+            '<div class="meta-right">' +
+              '<div class="meta-label">Quote' + (doc.number != null ? ' ' + F.escapeHtml(String(doc.number)) : '') + '</div>' +
+              validRow +
+            '</div>' +
+          '</div>' +
+          scope +
+          '<div class="doc-hr"></div>' +
+          linesHtml(lines) +
+          '<div class="totals">' +
+            '<div class="total-row"><div class="total-label">Subtotal</div>' +
+              '<div class="money-s">' + F.money(doc.subtotal, CCY) + '</div></div>' +
+            taxRow +
+            '<div class="totals-rule"></div>' +
+            '<div class="total-row"><div class="grand-label">Total</div>' +
+              '<div class="money-xl">' + F.money(doc.total, CCY) + '</div></div>' +
+            depositRow +
+          '</div>' +
+          exclusionsHtml(doc.exclusions) +
+          signatureBlock(doc) +
+          terms +
+        '</div>' +
+        '<div class="sent-with"><a href="https://' + location.host + '/">Sent with Foreman</a>' + watermark + '</div>' +
+      '</div>';
+  }
+
+  function setupDock(payload) {
+    var doc = payload.document;
+    var biz = payload.business || {};
+    var open = doc.status === 'sent' || doc.status === 'viewed';
+    if (!open) { dock.hidden = true; return; }
+    dock.hidden = false;
+    var ask = document.getElementById('askBtn');
+    if (biz.email) {
+      ask.href = 'mailto:' + biz.email + '?subject=' +
+        encodeURIComponent('Question about quote' + (doc.number != null ? ' ' + doc.number : ''));
+    } else if (biz.phone) {
+      ask.href = 'sms:' + biz.phone.replace(/[^\d+]/g, '');
+    } else {
+      ask.style.display = 'none';
+    }
+  }
+
+  // ---------- accept / signature ----------
+  function openSheet() {
+    var doc = DOC.document;
+    document.getElementById('sheetSub').textContent =
+      'You’re accepting this quote total of ' + F.money(doc.total, CCY) + '.';
+    var nm = document.getElementById('signedName');
+    if (DOC.client_first_name && !nm.value) nm.value = '';
+    sheet.hidden = false;
+    document.body.style.overflow = 'hidden';
+    setTimeout(initCanvas, 0);
+  }
+  function closeSheet() {
+    sheet.hidden = true;
+    document.body.style.overflow = '';
+  }
+
+  function initCanvas() {
+    canvas = document.getElementById('sig');
+    if (!canvas) return;
+    ctx = canvas.getContext('2d');
+    ctx.lineWidth = 5; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    var ink = getComputedStyle(document.documentElement).getPropertyValue('--ink').trim() || '#1A1D21';
+    ctx.strokeStyle = ink;
+    hasDrawn = false;
+    document.getElementById('sigHint').style.display = '';
+  }
+  function pt(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * (canvas.width / r.width), y: (e.clientY - r.top) * (canvas.height / r.height) };
+  }
+  function down(e) {
+    if (!ctx) return;
+    e.preventDefault();
+    if (e.target.setPointerCapture && e.pointerId != null) { try { e.target.setPointerCapture(e.pointerId); } catch (x) {} }
+    drawing = true;
+    var p = pt(e);
+    ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x + 0.5, p.y + 0.5); ctx.stroke();
+    if (!hasDrawn) { hasDrawn = true; document.getElementById('sigHint').style.display = 'none'; }
+  }
+  function move(e) {
+    if (!drawing || !ctx) return;
+    e.preventDefault();
+    var p = pt(e);
+    ctx.lineTo(p.x, p.y); ctx.stroke();
+  }
+  function up() { drawing = false; }
+  function clearSig() {
+    if (ctx && canvas) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    hasDrawn = false;
+    document.getElementById('sigHint').style.display = '';
+  }
+
+  function showError(msg) {
+    var el = document.getElementById('acceptError');
+    el.textContent = msg; el.hidden = false;
+  }
+
+  function confirmAccept() {
+    var name = document.getElementById('signedName').value.trim();
+    var errEl = document.getElementById('acceptError');
+    errEl.hidden = true;
+    if (!hasDrawn) { showError('Please sign in the box above.'); return; }
+    if (!name) { showError('Please type your name.'); return; }
+
+    var btn = document.getElementById('confirmAccept');
+    btn.disabled = true; btn.textContent = 'Sending…';
+
+    var png = canvas.toDataURL('image/png');
+    F.acceptQuote({ token: token, signed_name: name, signature_png_base64: png }).then(function (res) {
+      if (res.ok && res.data && res.data.status === 'accepted') {
+        // Reflect locally, re-render with the ACCEPTED stamp slam.
+        DOC.document.status = 'accepted';
+        DOC.document.signed_name = name;
+        DOC.document.accepted_at = new Date().toISOString();
+        closeSheet();
+        render(DOC, true);
+        setupDock(DOC);
+        toast('Accepted — thank you!');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      } else {
+        var m = (res.data && res.data.error) || 'Something went wrong. Please try again.';
+        if (res.status === 409) m = 'This quote can no longer be accepted (it may already be accepted or withdrawn).';
+        showError(m);
+        btn.disabled = false; btn.textContent = 'Sign & accept';
+      }
+    }).catch(function () {
+      showError('Network error. Check your connection and try again.');
+      btn.disabled = false; btn.textContent = 'Sign & accept';
+    });
+  }
+
+  function toast(msg) {
+    var t = document.createElement('div');
+    t.className = 'toast'; t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(function () { t.remove(); }, 2600);
+  }
+
+  // Wire static controls.
+  document.getElementById('acceptBtn').addEventListener('click', openSheet);
+  document.getElementById('scrim').addEventListener('click', closeSheet);
+  document.getElementById('clearSig').addEventListener('click', clearSig);
+  document.getElementById('confirmAccept').addEventListener('click', confirmAccept);
+  (function bindCanvasEvents() {
+    // Delegate via the sheet so listeners exist before canvas is shown.
+    document.addEventListener('pointerdown', function (e) { if (e.target.id === 'sig') down(e); });
+    document.addEventListener('pointermove', function (e) { if (drawing) move(e); });
+    document.addEventListener('pointerup', up);
+    document.addEventListener('pointercancel', up);
+  })();
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !sheet.hidden) closeSheet(); });
+
+  // ---------- load ----------
+  F.fetchDocument('quote', token).then(function (res) {
+    if (res.status === 404) {
+      stateScreen('Quote not found',
+        'This quote link is invalid or has been removed. Double-check the link from your text message, or reach out to the business that sent it.',
+        { href: 'https://' + location.host + '/', label: 'About Foreman' });
+      return;
+    }
+    if (!res.ok || !res.data || !res.data.document) {
+      stateScreen('Couldn’t load this quote',
+        'Something went wrong on our end. Please try again in a moment.',
+        null);
+      return;
+    }
+    DOC = res.data;
+    CCY = (DOC.business && DOC.business.currency) || 'USD';
+    render(DOC, false);
+    setupDock(DOC);
+  }).catch(function () {
+    stateScreen('Couldn’t load this quote',
+      'Check your internet connection and try again.', null);
+  });
+})();
+</script>
+</body>
+</html>

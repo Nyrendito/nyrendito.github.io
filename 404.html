@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Foreman</title>
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#fcfcfa" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#15171a" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/assets/foreman.css">
+<script>
+(function () {
+  // Support clean URLs like /q/<token> and /i/<token> by redirecting to the
+  // query-string form the document pages read (/q/?token=<token>).
+  try {
+    var path = location.pathname.replace(/\/+$/, ''); // strip trailing slash
+    var m = path.match(/^\/(q|i)\/([^\/]+)$/i);
+    if (m) {
+      var kind = m[1].toLowerCase();
+      var token = m[2];
+      // Don't loop if someone literally hit /q/index.html etc.
+      if (token && token.toLowerCase() !== 'index.html') {
+        location.replace('/' + kind + '/?token=' + encodeURIComponent(token));
+      }
+    }
+  } catch (e) { /* fall through to the not-found UI */ }
+})();
+</script>
+</head>
+<body>
+<main class="state-pad">
+  <a class="brand" href="/" style="margin-bottom:8px"><span class="mark">F</span> Foreman</a>
+  <div class="state-title">Page not found</div>
+  <div class="state-body">The page you’re looking for doesn’t exist. If you were sent a quote or invoice link, reopen it from your text message.</div>
+  <a class="btn-quiet" style="margin-top:14px" href="/">Go to Foreman</a>
+</main>
+</body>
+</html>
