@@ -6,8 +6,8 @@
 <title>Quote — Foreman</title>
 <meta name="description" content="Your quote.">
 <meta name="robots" content="noindex">
-<meta name="theme-color" content="#fcfcfa" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#15171a" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f4f5f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)">
 <link rel="stylesheet" href="/assets/foreman.css">
 <script src="https://js.stripe.com/v3/"></script>
 </head>
@@ -115,6 +115,18 @@
     return bits.join(' · ');
   }
 
+  function thumbsHtml(line) {
+    var photos = line && line.photo_paths;
+    if (!photos || !photos.length) return '';
+    var imgs = photos.map(function (url) {
+      if (!url) return '';
+      return '<img src="' + F.escapeHtml(url) + '" alt="" loading="lazy" ' +
+        'onerror="this.style.display=\'none\'">';
+    }).join('');
+    if (!imgs) return '';
+    return '<div class="line-thumbs">' + imgs + '</div>';
+  }
+
   function linesHtml(lines) {
     if (!lines || !lines.length) return '';
     return lines.map(function (l, i) {
@@ -124,6 +136,7 @@
         '<div style="min-width:0">' +
           '<div class="line-desc">' + F.escapeHtml(l.description || '') + '</div>' +
           (qty ? '<div class="line-qty">' + F.escapeHtml(qty) + '</div>' : '') +
+          thumbsHtml(l) +
         '</div>' +
         '<div class="line-amt money-m">' + F.money(l.total, CCY) + '</div>' +
       '</div>';
