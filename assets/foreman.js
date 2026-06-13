@@ -124,7 +124,7 @@
   // Stripe platform publishable key (Stripe ▸ Developers ▸ API keys). Used by the
   // invoice page to confirm a card / Apple Pay payment via Stripe.js. Safe to ship
   // publicly. Leave as-is until you paste your real pk_… key.
-  var STRIPE_PK = 'pk_test_REPLACE_WITH_YOUR_STRIPE_PUBLISHABLE_KEY';
+  var STRIPE_PK = 'pk_test_51TbjtC14nvKH18XdpLlOQlGcpk8gxFPbBnTYvRg6rHexGS6tfU81JNxQuQ2J8jFukUwsnVmgmEbyokKuBaIYrbyB00euIBhqlP';
 
   // Ask the backend to create a PaymentIntent for an invoice/quote balance.
   function createPaymentIntent(kind, token, amount_cents) {
