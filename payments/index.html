@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Payments — Foreman</title>
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#f4f5f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/assets/foreman.css">
+</head>
+<body>
+<div class="doc-wrap">
+  <div class="state-pad" style="text-align:center;max-width:420px;margin:0 auto">
+    <div id="icon" style="font-size:44px;margin-bottom:8px">✅</div>
+    <div class="state-title" id="title">You're all set</div>
+    <div class="state-body" id="body">
+      Your payout account is connected. Head back to the Foreman app —
+      every invoice now shows a <strong>Pay</strong> button.
+    </div>
+    <a class="btn-quiet" style="margin-top:18px" href="https://nyrendito.github.io/">About Foreman</a>
+  </div>
+</div>
+<script>
+  (function () {
+    // Stripe sends ?retry=1 if onboarding was left incomplete.
+    var params = new URLSearchParams(location.search);
+    if (params.get('retry')) {
+      document.getElementById('icon').textContent = '↩️';
+      document.getElementById('title').textContent = 'Almost there';
+      document.getElementById('body').innerHTML =
+        'Setup wasn’t finished. Reopen <strong>Set up payments</strong> in the Foreman app to pick up where you left off.';
+    }
+  })();
+</script>
+</body>
+</html>
