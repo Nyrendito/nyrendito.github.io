@@ -9,6 +9,7 @@
 <meta name="theme-color" content="#fcfcfa" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#15171a" media="(prefers-color-scheme: dark)">
 <link rel="stylesheet" href="/assets/foreman.css">
+<script src="https://js.stripe.com/v3/"></script>
 </head>
 <body>
 
@@ -25,6 +26,9 @@
   <div class="dock-inner">
     <button id="acceptBtn" class="btn-primary" type="button">Accept &amp; sign</button>
     <a id="askBtn" class="btn-quiet" href="https://apps.apple.com/app/id6779614706">Ask a question</a>
+  </div>
+  <div class="dock-decline">
+    <button id="declineBtn" class="btn-text-quiet" type="button">Can&rsquo;t accept this quote</button>
   </div>
 </div>
 
@@ -64,6 +68,8 @@
   var CCY = 'USD';
   var hasDrawn = false;
   var ctx = null, canvas = null, drawing = false;
+  var confettiFired = false;   // guard: fire accepted-confetti burst only once
+  var depositPaidDone = false; // guard: don't re-show the deposit step after paying
 
   function stateScreen(title, body, link) {
     dock.hidden = true;
@@ -137,10 +143,15 @@
     if (doc.status !== 'accepted') return '';
     var name = doc.signed_name || 'the customer';
     var when = doc.accepted_at ? F.formatDate(doc.accepted_at) : '';
+    // Prefer the homeowner's real drawn signature (short-lived signed URL).
+    // Fall back to the decorative squiggle only when no signature is available.
+    var mark = doc.signature_url
+      ? '<img class="sig-img" src="' + F.escapeHtml(doc.signature_url) + '" alt="Signature">'
+      : squiggleSvg();
     return '<div class="doc-hr doc-hr--inset"></div>' +
       '<div class="sig-block">' +
         '<div class="excl-label">Accepted</div>' +
-        '<div style="margin-top:8px;height:60px;display:flex;align-items:flex-end">' + squiggleSvg() + '</div>' +
+        '<div style="margin-top:8px;height:80px;display:flex;align-items:flex-end">' + mark + '</div>' +
         '<div class="sig-line"></div>' +
         '<div class="sig-caption">Signed by ' + F.escapeHtml(name) + (when ? ' · ' + when : '') + '</div>' +
       '</div>';
@@ -159,6 +170,29 @@
       if (isFinite(p) && p > 0 && p < 100) pct = ' (' + p + '% deposit)';
     }
     return 'Due on acceptance' + pct;
+  }
+
+  // Deposit row markup. When some deposit has been paid, show "X of Y deposit
+  // paid" (with the remaining balance); otherwise the original "due on
+  // acceptance" row.
+  function depositRowHtml(doc) {
+    var required = Number(doc.deposit_required) || 0;
+    if (required <= 0) return '';
+    var paid = Number(doc.deposit_paid) || 0;
+    if (paid > 0) {
+      var remaining = Math.max(0, required - paid);
+      var label = remaining > 0
+        ? F.money(paid, CCY) + ' of ' + F.money(required, CCY) + ' deposit paid'
+        : 'Deposit paid in full';
+      var amtCol = remaining > 0
+        ? '<div class="money-s">' + F.money(remaining, CCY) + ' left</div>'
+        : '<div class="money-s" style="color:var(--cash)">' + F.money(required, CCY) + '</div>';
+      return '<div class="total-row" style="margin-top:10px"><div class="meta-sub" style="margin:0">' +
+        F.escapeHtml(label) + '</div>' + amtCol + '</div>';
+    }
+    return '<div class="total-row" style="margin-top:10px"><div class="meta-sub" style="margin:0">' +
+      F.escapeHtml(depositLabel(doc)) + '</div>' +
+      '<div class="money-s">' + F.money(required, CCY) + '</div></div>';
   }
 
   function render(payload, animateStamp) {
@@ -180,11 +214,7 @@
           '<div class="money-s">' + F.money(doc.tax_amount, CCY) + '</div></div>'
       : '';
 
-    var depositRow = Number(doc.deposit_required) > 0
-      ? '<div class="total-row" style="margin-top:10px"><div class="meta-sub" style="margin:0">' +
-          F.escapeHtml(depositLabel(doc)) + '</div>' +
-          '<div class="money-s">' + F.money(doc.deposit_required, CCY) + '</div></div>'
-      : '';
+    var depositRow = depositRowHtml(doc);
 
     var validRow = doc.valid_until
       ? '<div class="meta-sub">Valid until ' + F.escapeHtml(F.formatDate(doc.valid_until)) + '</div>'
@@ -204,8 +234,10 @@
       ? '<div class="doc-hr doc-hr--inset"></div><div class="footnote">' + F.escapeHtml(biz.terms) + '</div>'
       : '';
 
-    var watermark = biz.watermark
-      ? '<span class="watermark-note">Made with Foreman</span>'
+    // Tier-gated footer: only FREE-tier pros (biz.watermark) carry the quiet
+    // "Sent with Foreman" line. Paid Pros get no Foreman footer at all.
+    var sentWith = biz.watermark
+      ? '<div class="sent-with"><a href="https://' + location.host + '/">Sent with Foreman</a></div>'
       : '';
 
     root.innerHTML =
@@ -248,13 +280,127 @@
           signatureBlock(doc) +
           terms +
         '</div>' +
-        '<div class="sent-with"><a href="https://' + location.host + '/">Sent with Foreman</a>' + watermark + '</div>' +
+        sentWith +
       '</div>';
+
+    // On the live ACCEPTED transition (stamp slam), fire the cash-green
+    // confetti once. The deposit-payment step is wired by setupDock(), which
+    // is always called right after render() in both load and accept flows.
+    if (doc.status === 'accepted' && animateStamp && !confettiFired) {
+      confettiFired = true;
+      F.fireConfetti();
+    }
+  }
+
+  // ---------- deposit payment ----------
+  function depositOutstanding(doc) {
+    var required = Number(doc.deposit_required) || 0;
+    var paid = Number(doc.deposit_paid) || 0;
+    return Math.max(0, required - paid);
+  }
+
+  // Replace the accept dock with a "Pay $X deposit" step after acceptance,
+  // when a deposit is still owed and the pro has Stripe enabled. Otherwise
+  // leave the existing post-accept thank-you (no dock).
+  function maybeShowDepositStep(payload) {
+    var doc = payload.document;
+    var biz = payload.business || {};
+    var outstanding = depositOutstanding(doc);
+    if (!biz.stripe_enabled || outstanding <= 0) { dock.hidden = true; return; }
+    if (depositPaidDone) { dock.hidden = true; return; }
+
+    dock.hidden = false;
+    dock.innerHTML =
+      '<div class="dock-inner">' +
+        '<button id="depositBtn" type="button" class="btn-primary" style="width:100%;border:0;cursor:pointer">' +
+          'Pay ' + F.money(outstanding, CCY) + ' deposit</button>' +
+      '</div>';
+    var btn = document.getElementById('depositBtn');
+    if (btn) btn.addEventListener('click', function () { startDepositPayment(outstanding); });
+  }
+
+  // Mirrors the /i/ startPayment bottom-sheet exactly — same markup/styles/flow,
+  // with "deposit" wording and the 'quote' kind.
+  function startDepositPayment(amount) {
+    var pk = F.STRIPE_PK || '';
+    if (!window.Stripe || pk.indexOf('pk_') !== 0 || pk.indexOf('REPLACE') !== -1) {
+      alert('Online payment isn’t available yet. Please contact the business to arrange your deposit.');
+      return;
+    }
+
+    var ov = document.createElement('div');
+    ov.id = 'pay-overlay';
+    ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;' +
+      'align-items:flex-end;justify-content:center;z-index:9999;animation:payfade .2s ease';
+    var amt = F.money(amount, CCY);
+    ov.innerHTML =
+      '<div style="background:var(--paper,#fff);width:100%;max-width:480px;' +
+        'border-radius:18px 18px 0 0;padding:20px 18px calc(20px + env(safe-area-inset-bottom));' +
+        'box-shadow:0 -8px 40px rgba(0,0,0,.22)">' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">' +
+          '<div style="font-weight:800;font-size:18px;color:var(--ink,#15171a)">Pay ' + amt + ' deposit</div>' +
+          '<button id="pay-close" type="button" aria-label="Close" style="border:0;background:transparent;' +
+            'font-size:24px;line-height:1;color:var(--steel,#888);cursor:pointer;padding:0 4px">×</button>' +
+        '</div>' +
+        '<div id="payment-element" style="min-height:48px"></div>' +
+        '<div id="pay-error" role="alert" style="color:var(--alarm,#c0392b);font-size:14px;margin-top:10px"></div>' +
+        '<button id="pay-submit" type="button" class="btn-primary" disabled ' +
+          'style="width:100%;border:0;cursor:pointer;margin-top:16px;opacity:.6">Pay ' + amt + ' deposit</button>' +
+        '<div style="text-align:center;font-size:12px;color:var(--steel,#999);margin-top:12px">🔒 Secured by Stripe</div>' +
+      '</div>';
+    document.body.appendChild(ov);
+
+    var card = ov.firstChild;
+    var errEl = document.getElementById('pay-error');
+    var submitBtn = document.getElementById('pay-submit');
+    document.getElementById('pay-close').addEventListener('click', function () { ov.remove(); });
+    ov.addEventListener('click', function (e) { if (e.target === ov) ov.remove(); });
+
+    F.createPaymentIntent('quote', token, Math.round(amount * 100)).then(function (res) {
+      if (!res.ok || !res.data || !res.data.client_secret) {
+        errEl.textContent = (res.data && res.data.error) ? res.data.error
+          : 'Couldn’t start the payment. Please try again or contact the business.';
+        return;
+      }
+      var stripe = Stripe(pk);
+      var elements = stripe.elements({ clientSecret: res.data.client_secret, appearance: { theme: 'stripe' } });
+      elements.create('payment').mount('#payment-element');
+      submitBtn.disabled = false;
+      submitBtn.style.opacity = '1';
+
+      submitBtn.addEventListener('click', function () {
+        submitBtn.disabled = true; submitBtn.style.opacity = '.6';
+        submitBtn.textContent = 'Processing…'; errEl.textContent = '';
+        stripe.confirmPayment({ elements: elements, redirect: 'if_required' }).then(function (result) {
+          if (result.error) {
+            errEl.textContent = result.error.message || 'Payment failed. Please try again.';
+            submitBtn.disabled = false; submitBtn.style.opacity = '1';
+            submitBtn.textContent = 'Pay ' + amt + ' deposit';
+          } else if (result.paymentIntent && result.paymentIntent.status === 'succeeded') {
+            depositPaidDone = true;
+            card.innerHTML =
+              '<div style="text-align:center;padding:24px 0 8px">' +
+                '<div style="font-size:44px">✅</div>' +
+                '<div style="font-weight:800;font-size:20px;color:var(--cash,#1a7f4b);margin-top:10px">Deposit paid</div>' +
+                '<div style="color:var(--steel,#888);margin-top:6px">Thank you! ' + amt + ' received.</div>' +
+              '</div>';
+            setTimeout(function () { ov.remove(); dock.hidden = true; }, 2200);
+          } else {
+            errEl.textContent = 'Payment is processing — you can safely close this page.';
+            submitBtn.textContent = 'Pay ' + amt + ' deposit';
+          }
+        });
+      });
+    }).catch(function () {
+      errEl.textContent = 'Network error. Please check your connection and try again.';
+    });
   }
 
   function setupDock(payload) {
     var doc = payload.document;
     var biz = payload.business || {};
+    // An accepted quote may still owe a deposit — let the deposit step decide.
+    if (doc.status === 'accepted') { maybeShowDepositStep(payload); return; }
     var open = doc.status === 'sent' || doc.status === 'viewed';
     if (!open) { dock.hidden = true; return; }
     dock.hidden = false;
@@ -360,6 +506,31 @@
     });
   }
 
+  // ---------- decline ----------
+  function declineQuote() {
+    if (!DOC) return;
+    if (!window.confirm('Decline this quote? The business will be notified that you can’t accept it.')) return;
+    var btn = document.getElementById('declineBtn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Declining…'; }
+    F.declineQuote(token).then(function (res) {
+      if (res.ok && res.data && res.data.status === 'declined') {
+        // Reflect locally and re-render the DECLINED stamp, mirroring accept.
+        DOC.document.status = 'declined';
+        render(DOC, true);
+        setupDock(DOC);
+        toast('Quote declined.');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      } else {
+        if (btn) { btn.disabled = false; btn.textContent = 'Can’t accept this quote'; }
+        var m = (res.data && res.data.error) || 'Couldn’t decline right now. Please try again.';
+        toast(m);
+      }
+    }).catch(function () {
+      if (btn) { btn.disabled = false; btn.textContent = 'Can’t accept this quote'; }
+      toast('Network error. Check your connection and try again.');
+    });
+  }
+
   function toast(msg) {
     var t = document.createElement('div');
     t.className = 'toast'; t.textContent = msg;
@@ -369,6 +540,7 @@
 
   // Wire static controls.
   document.getElementById('acceptBtn').addEventListener('click', openSheet);
+  document.getElementById('declineBtn').addEventListener('click', declineQuote);
   document.getElementById('scrim').addEventListener('click', closeSheet);
   document.getElementById('clearSig').addEventListener('click', clearSig);
   document.getElementById('confirmAccept').addEventListener('click', confirmAccept);

@@ -9,6 +9,7 @@
 <meta name="theme-color" content="#fcfcfa" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#15171a" media="(prefers-color-scheme: dark)">
 <link rel="stylesheet" href="/assets/foreman.css">
+<script src="https://js.stripe.com/v3/"></script>
 </head>
 <body>
 
@@ -27,6 +28,7 @@
   var token = F.getToken();
   var root = document.getElementById('root');
   var CCY = 'USD';
+  var confettiFired = false;   // guard: fire the paid-confetti burst only once
 
   function stateScreen(title, body, link) {
     root.innerHTML =
@@ -154,10 +156,15 @@
       ? '<div class="meta-sub">Due ' + F.escapeHtml(F.formatDate(doc.due_date)) + '</div>'
       : '';
 
-    // Payment instructions (no online payment in scope — never a fake button).
+    // Payment instructions. If the business has online payments on, the dock shows
+    // a real Pay button (card / Apple Pay via Stripe); otherwise fall back to contact.
+    var canPayOnline = !!biz.stripe_enabled && st.kind !== 'paid' && st.balance > 0;
     var payHint;
     if (st.kind === 'paid') {
       payHint = 'This page is your receipt. Thank you for your business.';
+    } else if (canPayOnline) {
+      payHint = 'Pay securely below by card or Apple Pay. Powered by Stripe — ' +
+        F.escapeHtml(biz.name || 'the business') + ' receives the payment directly.';
     } else {
       var contact = biz.email ? biz.email : (biz.phone ? biz.phone : 'the business');
       payHint = 'To pay ' + F.money(st.balance, CCY) + ', contact ' +
@@ -168,7 +175,11 @@
     var terms = biz.terms ? ' ' + F.escapeHtml(biz.terms) : '';
 
     var contactBtn = '';
-    if (st.kind !== 'paid' && (biz.email || biz.phone)) {
+    if (canPayOnline) {
+      contactBtn = '<div class="dock"><div class="dock-inner">' +
+        '<button id="pay-btn" type="button" class="btn-primary" style="width:100%;border:0;cursor:pointer">Pay ' + F.money(st.balance, CCY) + '</button>' +
+        '</div></div>';
+    } else if (st.kind !== 'paid' && (biz.email || biz.phone)) {
       var href = biz.email
         ? 'mailto:' + biz.email + '?subject=' + encodeURIComponent('Payment for invoice' + (doc.number != null ? ' #' + doc.number : ''))
         : 'sms:' + String(biz.phone).replace(/[^\d+]/g, '');
@@ -177,7 +188,11 @@
         '</div></div>';
     }
 
-    var watermark = biz.watermark ? '<span class="watermark-note">Made with Foreman</span>' : '';
+    // Tier-gated footer: only FREE-tier pros (biz.watermark) carry the quiet
+    // "Sent with Foreman" line. Paid Pros get no Foreman footer at all.
+    var sentWith = biz.watermark
+      ? '<div class="sent-with"><a href="https://' + location.host + '/">Sent with Foreman</a></div>'
+      : '';
 
     root.innerHTML =
       '<div class="doc-col">' +
@@ -221,9 +236,99 @@
           '<div class="doc-hr doc-hr--inset"></div>' +
           '<div class="footnote">' + payHint + terms + '</div>' +
         '</div>' +
-        '<div class="sent-with"><a href="https://' + location.host + '/">Sent with Foreman</a>' + watermark + '</div>' +
+        sentWith +
       '</div>' +
       contactBtn;
+
+    var payBtn = document.getElementById('pay-btn');
+    if (payBtn) {
+      payBtn.addEventListener('click', function () { startPayment(st.balance); });
+    }
+
+    // Cash-green confetti once when a paid invoice first renders.
+    if (st.kind === 'paid' && !confettiFired) {
+      confettiFired = true;
+      F.fireConfetti();
+    }
+  }
+
+  // ── Online payment (Stripe Payment Element) ──────────────────────────────
+  // Opens a bottom sheet, creates a PaymentIntent on the pro's connected
+  // account, mounts Stripe's Payment Element (card + Apple/Google Pay), and
+  // confirms. The stripe-webhook marks the invoice paid server-side; we reload
+  // so the page re-fetches and shows the Paid receipt.
+  function startPayment(balance) {
+    var pk = F.STRIPE_PK || '';
+    if (!window.Stripe || pk.indexOf('pk_') !== 0 || pk.indexOf('REPLACE') !== -1) {
+      alert('Online payment isn’t available yet. Please contact the business to arrange payment.');
+      return;
+    }
+
+    var ov = document.createElement('div');
+    ov.id = 'pay-overlay';
+    ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;' +
+      'align-items:flex-end;justify-content:center;z-index:9999;animation:payfade .2s ease';
+    var amt = F.money(balance, CCY);
+    ov.innerHTML =
+      '<div style="background:var(--paper,#fff);width:100%;max-width:480px;' +
+        'border-radius:18px 18px 0 0;padding:20px 18px calc(20px + env(safe-area-inset-bottom));' +
+        'box-shadow:0 -8px 40px rgba(0,0,0,.22)">' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">' +
+          '<div style="font-weight:800;font-size:18px;color:var(--ink,#15171a)">Pay ' + amt + '</div>' +
+          '<button id="pay-close" type="button" aria-label="Close" style="border:0;background:transparent;' +
+            'font-size:24px;line-height:1;color:var(--steel,#888);cursor:pointer;padding:0 4px">×</button>' +
+        '</div>' +
+        '<div id="payment-element" style="min-height:48px"></div>' +
+        '<div id="pay-error" role="alert" style="color:var(--alarm,#c0392b);font-size:14px;margin-top:10px"></div>' +
+        '<button id="pay-submit" type="button" class="btn-primary" disabled ' +
+          'style="width:100%;border:0;cursor:pointer;margin-top:16px;opacity:.6">Pay ' + amt + '</button>' +
+        '<div style="text-align:center;font-size:12px;color:var(--steel,#999);margin-top:12px">🔒 Secured by Stripe</div>' +
+      '</div>';
+    document.body.appendChild(ov);
+
+    var card = ov.firstChild;
+    var errEl = document.getElementById('pay-error');
+    var submitBtn = document.getElementById('pay-submit');
+    document.getElementById('pay-close').addEventListener('click', function () { ov.remove(); });
+    ov.addEventListener('click', function (e) { if (e.target === ov) ov.remove(); });
+
+    F.createPaymentIntent('invoice', token, Math.round(balance * 100)).then(function (res) {
+      if (!res.ok || !res.data || !res.data.client_secret) {
+        errEl.textContent = (res.data && res.data.error) ? res.data.error
+          : 'Couldn’t start the payment. Please try again or contact the business.';
+        return;
+      }
+      var stripe = Stripe(pk);
+      var elements = stripe.elements({ clientSecret: res.data.client_secret, appearance: { theme: 'stripe' } });
+      elements.create('payment').mount('#payment-element');
+      submitBtn.disabled = false;
+      submitBtn.style.opacity = '1';
+
+      submitBtn.addEventListener('click', function () {
+        submitBtn.disabled = true; submitBtn.style.opacity = '.6';
+        submitBtn.textContent = 'Processing…'; errEl.textContent = '';
+        stripe.confirmPayment({ elements: elements, redirect: 'if_required' }).then(function (result) {
+          if (result.error) {
+            errEl.textContent = result.error.message || 'Payment failed. Please try again.';
+            submitBtn.disabled = false; submitBtn.style.opacity = '1';
+            submitBtn.textContent = 'Pay ' + amt;
+          } else if (result.paymentIntent && result.paymentIntent.status === 'succeeded') {
+            card.innerHTML =
+              '<div style="text-align:center;padding:24px 0 8px">' +
+                '<div style="font-size:44px">✅</div>' +
+                '<div style="font-weight:800;font-size:20px;color:var(--cash,#1a7f4b);margin-top:10px">Paid ' + amt + '</div>' +
+                '<div style="color:var(--steel,#888);margin-top:6px">Thank you! Updating your receipt…</div>' +
+              '</div>';
+            setTimeout(function () { location.reload(); }, 2200);
+          } else {
+            errEl.textContent = 'Payment is processing — you can safely close this page.';
+            submitBtn.textContent = 'Pay ' + amt;
+          }
+        });
+      });
+    }).catch(function () {
+      errEl.textContent = 'Network error. Please check your connection and try again.';
+    });
   }
 
   F.fetchDocument('invoice', token).then(function (res) {
